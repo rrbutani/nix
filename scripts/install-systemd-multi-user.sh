@@ -29,23 +29,11 @@ escape_systemd_env() {
     echo "${temp_var//\%/%%}"
 }
 
-# Gather all non-empty proxy environment variables into a string
-create_systemd_proxy_env() {
-    vars="http_proxy https_proxy ftp_proxy no_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY NO_PROXY"
-    for v in $vars; do
-        if [ "x${!v:-}" != "x" ]; then
-            echo "Environment=${v}=$(escape_systemd_env ${!v})"
-        fi
+# Gather all the given environment variables into a string
+create_systemd_env() {
+    for v in "${@}"; do
+        echo "Environment=${v}=$(escape_systemd_env "${!v}")"
     done
-}
-
-handle_network_proxy() {
-    # Create a systemd unit override with proxy environment variables
-    # if any proxy environment variables are not empty.
-    PROXY_ENV_STRING=$(create_systemd_proxy_env)
-    if [ -n "${PROXY_ENV_STRING}" ]; then
-        create_systemd_override "${PROXY_ENV_STRING}"
-    fi
 }
 
 poly_cure_artifacts() {
@@ -87,6 +75,16 @@ EOF
     fi
 }
 
+poly_apply_network_proxies_to_daemon() {
+    if ! [ -e /run/systemd/system ]; then
+        # Defensive check, should never get here..
+        reminder "I only know how to apply proxies to systemd services."
+        return
+    fi
+
+    create_systemd_override "$(create_systemd_env "${@}")"
+}
+
 poly_configure_nix_daemon_service() {
     if [ -e /run/systemd/system ]; then
         task "Setting up the nix-daemon systemd service"
@@ -103,7 +101,7 @@ poly_configure_nix_daemon_service() {
         _sudo "to set up the nix-daemon socket service" \
               systemctl enable "/nix/var/nix/profiles/default$SOCKET_SRC"
 
-        handle_network_proxy
+        handle_network_proxies
 
         _sudo "to load the systemd unit for nix-daemon" \
               systemctl daemon-reload

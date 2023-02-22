@@ -50,6 +50,8 @@ readonly PROFILE_FISH_PREFIXES=(
 )
 readonly PROFILE_NIX_FILE_FISH="$NIX_ROOT/var/nix/profiles/default/etc/profile.d/nix-daemon.fish"
 
+readonly PROXY_ENV_VARS=(http_proxy https_proxy ftp_proxy no_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY NO_PROXY)
+
 readonly NIX_INSTALLED_NIX="@nix@"
 readonly NIX_INSTALLED_CACERT="@cacert@"
 #readonly NIX_INSTALLED_NIX="/nix/store/j8dbv5w6jl34caywh2ygdy88knx1mdf7-nix-2.3.6"
@@ -692,6 +694,31 @@ EOF
     fi
 }
 
+handle_network_proxies() {
+    local proxies_found=()
+
+    # Gather all the non-empty proxy env var names:
+    for p in "${PROXY_ENV_VARS[@]}"; do
+        if [[ -n "${!v:+x}" ]]; then
+            proxies_found+=("$p")
+        fi
+    done
+
+    # If there are 1 or more proxy env vars set, ask the user if they want us
+    # to add these to the daemon's configuration:
+    if [[ "${#proxies_found[@]}" == 0 ]]; then return; fi
+
+    warning "We found these proxy variables set: ${proxies_found[*]@Q}."
+    warning <<EOF
+nix-daemon may need these environment variables in order to access the internet.
+Depending on your system configuration these variables may not be automatically
+propagated to services.
+EOF
+    if ui_confirm "Would you like us to add these environment variables to the daemon's configuration?"; then
+        poly_apply_network_proxies_to_daemon "${proxies_found[@]}"
+    fi
+}
+
 welcome_to_nix() {
     ok "Welcome to the Multi-User Nix Installation"
 
@@ -932,7 +959,6 @@ EOF
     fi
 }
 
-
 place_nix_configuration() {
     cat <<EOF > "$SCRATCH/nix.conf"
 $NIX_EXTRA_CONF
@@ -941,7 +967,6 @@ EOF
     _sudo "to place the default nix daemon configuration (part 2)" \
           install -m 0664 "$SCRATCH/nix.conf" /etc/nix/nix.conf
 }
-
 
 main() {
     check_selinux
