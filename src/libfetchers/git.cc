@@ -154,7 +154,7 @@ WorkdirInfo getWorkdirInfo(const Input & input, const Path & workdir)
     env["LC_ALL"] = "C";
 
     /* Check whether HEAD points to something that looks like a commit,
-       since that is the refrence we want to use later on. */
+       since that is the reference we want to use later on. */
     auto result = runProgram(RunOptions {
         .program = "git",
         .args = { "-C", workdir, "--git-dir", gitDir, "rev-parse", "--verify", "--no-revs", "HEAD^{commit}" },
@@ -179,7 +179,7 @@ WorkdirInfo getWorkdirInfo(const Input & input, const Path & workdir)
 
     try {
         if (hasHead) {
-            // Using git diff is preferrable over lower-level operations here,
+            // Using git diff is preferable over lower-level operations here,
             // because its conceptually simpler and we only need the exit code anyways.
             auto gitDiffOpts = Strings({ "-C", workdir, "--git-dir", gitDir, "diff", "HEAD", "--quiet"});
             if (!submodules) {
