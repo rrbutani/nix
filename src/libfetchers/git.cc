@@ -47,7 +47,7 @@ bool touchCacheFile(const Path & path, time_t touch_time)
 
 Path getCachePath(std::string_view key)
 {
-    return getCacheDir() + "/nix/gitv3/" +
+    return getCacheDir() + "/nix/gitv4/" +
         hashString(htSHA256, key).to_string(Base32, false);
 }
 
