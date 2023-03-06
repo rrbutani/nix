@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+# invoke like `git`
+
+readonly GIT_CMD_LOG_FILE="${GIT_CMD_LOG_FILE:-"$(dirname "$0")/git-cmd-log"}"
+readonly REAL_GIT="${REAL_GIT:-"$(nix-build --expr "(import <nixpkgs> {}).git")/bin/git"}"
+
+echo -e "\n-----------------------------------------------------------------" >> "$GIT_CMD_LOG_FILE"
+echo "[git invocation] git ${*@K}" >> "$GIT_CMD_LOG_FILE"
+
+# pass through stdout/stderr of the git command as normal; route the `time`
+# command's stderr to the log file
+{ time { "$REAL_GIT" "${@}" 2>&3; }; } 3>&2 2>> "$GIT_CMD_LOG_FILE"
