@@ -51,6 +51,12 @@ Path getCachePath(std::string_view key)
         hashString(htSHA256, key).to_string(Base32, false);
 }
 
+std::string getNumJobs(void) {
+    if (settings.maxBuildJobs.get() == 0)
+        return "1";
+    else return settings.maxBuildJobs.to_string();
+}
+
 // Returns the name of the HEAD branch.
 //
 // Returns the head branch name as reported by git ls-remote --symref, e.g., if
@@ -613,6 +619,17 @@ struct GitInputScheme : InputScheme
                 }
             }
 
+            // if we want an unshallow repo but only have a shallow git dir
+            // we need to do a fetch:
+            {
+                bool isShallow = chomp(runProgram("git", true, { "-C", repoDir, "--git-dir", repoInfo.gitDir, "rev-parse", "--is-shallow-repository" })) == "true";
+                if (isShallow && !repoInfo.shallow) {
+                    doFetch = true;
+                }
+            }
+
+            // TODO: really should disable GC in the cache git dirs on init...
+
             if (doFetch) {
                 Activity act(*logger, lvlTalkative, actUnknown, fmt("fetching Git repository '%s'", repoInfo.url));
 
@@ -626,16 +643,35 @@ struct GitInputScheme : InputScheme
                             : ref == "HEAD"
                                 ? ref
                                 : "refs/heads/" + ref;
-                    runProgram("git", true,
-                        { "-C", repoDir,
-                          "--git-dir", repoInfo.gitDir,
-                          "fetch",
-                          "--quiet",
-                          "--force",
-                          "--",
-                          repoInfo.url,
-                          fmt("%s:%s", fetchRef, fetchRef)
-                        });
+
+                    auto fetchOpts = Strings({
+                        "-C", repoDir,
+                        "--git-dir", repoInfo.gitDir,
+                        "fetch", "--quiet", "--force",
+                        "--jobs", getNumJobs()
+                    });
+
+                    if (repoInfo.shallow) {
+                        fetchOpts.emplace_back("--depth=1");
+                    } else {
+                        // If the cached git dir is already shallow and we've
+                        // been asked to do a full-depth clone, unshallow it.
+                        bool isShallow = chomp(runProgram("git", true, { "-C", repoDir, "--git-dir", repoInfo.gitDir, "rev-parse", "--is-shallow-repository" })) == "true";
+                        if (isShallow) {
+                            fetchOpts.emplace_back("--unshallow");
+                        }
+                    }
+
+                    // TODO: for shallow clones this will not actually check that
+                    // the rev is on the ref...
+                    //
+                    // also this may modify stuff (problematic for the local source
+                    // case)?
+                    fetchOpts.insert(fetchOpts.end(), {
+                        "--", repoInfo.url,
+                        fmt("%s:%s", repoInfo.shallow ? input.getRev()->gitRev() : fetchRef, fetchRef)
+                    });
+                    runProgram("git", true, fetchOpts);
                 } catch (Error & e) {
                     if (!pathExists(localRefFile)) throw;
                     warn("could not update local clone of Git repository '%s'; continuing with the most recent version", repoInfo.url);
@@ -655,6 +691,8 @@ struct GitInputScheme : InputScheme
 
         bool isShallow = chomp(runProgram("git", true, { "-C", repoDir, "--git-dir", repoInfo.gitDir, "rev-parse", "--is-shallow-repository" })) == "true";
 
+        // TODO: incompatibility with existing `nix` versions because if we make
+        // a shallow clone older `nix` versions won't know to unshallow it...
         if (isShallow && !repoInfo.shallow)
             throw Error("'%s' is a shallow Git repository, but shallow repositories are only allowed when `shallow = true;` is specified", repoInfo.url);
 
@@ -709,45 +747,154 @@ struct GitInputScheme : InputScheme
         Activity act(*logger, lvlChatty, actUnknown, fmt("copying Git tree '%s' to the store", input.to_string()));
 
         if (repoInfo.submodules) {
-            Path tmpGitDir = createTempDir();
-            AutoDelete delTmpGitDir(tmpGitDir, true);
+            // at this point, if our source is a local directory, repoDir points
+            // to a dir that we *cannot modify*
+            //
+            // if our source is external, repoDir points to a cache directory
+            // which we can and should modify directly
 
-            runProgram("git", true, { "-c", "init.defaultBranch=" + gitInitialBranch, "init", tmpDir, "--separate-git-dir", tmpGitDir });
+            // TODO: we only use this tmp dir if we've got a local directory
+            // source that we happen to need to update; we should gate the
+            // creation of this dir on that use case (a little complicated
+            // because of the scoping we want for this dir...)
+            //
+            // TODO: we should maybe actually create a cache dir and use that
+            // instead for local sources (in the event that we do actually end
+            // up having to fetch stuff)?
+            Path tmpGitDirForLocalSource = createTempDir();
+            AutoDelete delTmpGitDir(tmpGitDirForLocalSource, true);
 
-            {
-                // TODO: repoDir might lack the ref (it only checks if rev
-                // exists, see FIXME above) so use a big hammer and fetch
-                // everything to ensure we get the rev.
-                Activity act(*logger, lvlTalkative, actUnknown, fmt("making temporary clone of '%s'", repoDir));
-                runProgram("git", true, { "-C", tmpDir, "fetch", "--quiet", "--force",
-                        "--update-head-ok", "--", repoDir, "refs/*:refs/*" });
+            auto pathToGitFolder = repoDir;
+            if (repoInfo.isLocal) {
+                // can't modify `repoDir` directly so we use another git dir:
+                pathToGitFolder = tmpGitDirForLocalSource;
+
+                // note that we add `repoDir` as a _reference_; this means we
+                // will use objects from the local repo but will not modify its
+                // object store (i.e. it adds the local dir as an alternate)
+                //
+                // we also set `submodule.alternateLocation` to `superproject`
+                // meaning that it will inherit the alternates of the parent
+                // repo
+                runProgram("git", true, {
+                    "-c", "init.defaultBranch=" + gitInitialBranch,
+                    "init", tmpDir,
+                    "--separate-git-dir", pathToGitFolder,
+                    // https://git-scm.com/docs/git-clone#Documentation/git-clone.txt---reference-if-ableltrepositorygt
+                    "--reference", repoDir,
+                    // https://github.com/git/git/blob/d15644fe0226af7ffc874572d968598564a230dd/Documentation/config/submodule.txt#L96-L101
+                    "-c", "submodule.alternateLocation=superproject"
+                });
+
+            } else {
+                // TODO: should we disable GC on the cache repos?
+                // TODO: locking
+
+                // use `repoDir` directly:
+                pathToGitFolder = repoDir + "/" + repoInfo.gitDir;
             }
-
-            runProgram("git", true, { "-C", tmpDir, "checkout", "--quiet", rev.gitRev() });
 
             /* Ensure that we use the correct origin for fetching
                submodules. This matters for submodules with relative
                URLs. */
             if (repoInfo.isLocal) {
-                writeFile(tmpGitDir + "/config", readFile(repoDir + "/" + repoInfo.gitDir + "/config"));
+                writeFile(pathToGitFolder + "/config", readFile(repoDir + "/" + repoInfo.gitDir + "/config"));
 
                 /* Restore the config.bare setting we may have just
                    copied erroneously from the user's repo. */
-                runProgram("git", true, { "-C", tmpDir, "config", "core.bare", "false" });
-            } else
-                runProgram("git", true, { "-C", tmpDir, "config", "remote.origin.url", repoInfo.url });
+                runProgram("git", true, {
+                    "--git-dir", pathToGitFolder,
+                    "--work-tree", tmpDir,
+                    "config", "core.bare", "false"
+                });
+            } else {
+                runProgram("git", true, {
+                    "--git-dir", pathToGitFolder,
+                    "--work-tree", tmpDir,
+                    "config", "remote.origin.url", repoInfo.url
+                });
+            };
 
-            /* As an optimisation, copy the modules directory of the
-               source repo if it exists. */
-            auto modulesPath = repoDir + "/" + repoInfo.gitDir + "/modules";
-            if (pathExists(modulesPath)) {
-                Activity act(*logger, lvlTalkative, actUnknown, fmt("copying submodules of '%s'", repoInfo.url));
-                runProgram("cp", true, { "-R", "--", modulesPath, tmpGitDir + "/modules" });
+            // {
+            //     // TODO: repoDir might lack the ref (it only checks if rev
+            //     // exists, see FIXME above) so use a big hammer and fetch
+            //     // everything to ensure we get the rev.
+            //     Activity act(*logger, lvlTalkative, actUnknown, fmt("making temporary clone of '%s'", repoDir));
+            //     runProgram("git", true, { "-C", tmpDir, "fetch", "--quiet", "--force",
+            //             "--update-head-ok", "--", repoDir, "refs/*:refs/*" });
+            // }
+
+            // Check out the repo:
+            // TODO: logging
+            runProgram("git", true, {
+                "--git-dir", pathToGitFolder,
+                "--work-tree", tmpDir,
+                "checkout", "--quiet",
+                input.getRev()->gitRev(), ".",
+            });
+
+            // /* propagate shallow clone option to submodules */
+            // runProgram("git", true, {
+            //     "--git-dir", pathToGitFolder,
+            //     "--work-tree", tmpDir,
+            //     "-C", tmpDir, // necessary for `git-submodule` to work...
+            //     "submodule", "foreach", "--recursive",
+            //     (shallow
+            //         ? "cd $toplevel; git config -f .gitmodules submodule.$sm_path.shallow true"
+            //         : "cd $toplevel; git config -f .gitmodules submodule.$sm_path.shallow false"
+            //     )
+            // }); // TODO: is this sufficient to unshallow? TODO: add test..
+            // TODO: fix; this only applies to checked out submodules and thus doesn't work..
+
+            if (!repoInfo.shallow) {
+                // in case the repo's submodules were previously initialized as
+                // shallow:
+                //
+                // if the submodules have not yet been initialized this is a
+                // no-op.
+                runProgram("git", true, {
+                    "--git-dir", pathToGitFolder,
+                    "--work-tree", tmpDir,
+                    "-C", tmpDir, // necessary for `git-submodule` to work...
+                    "submodule", "foreach", "--recursive",
+                    ("git fetch --unshallow --jobs=" + getNumJobs())
+                }); // TODO: add test..
+
+                // TODO: not sure this actually works... (need to specify remote?); not sure it even matters.
             }
 
+            // And then checkout the submodules:
             {
                 Activity act(*logger, lvlTalkative, actUnknown, fmt("fetching submodules of '%s'", repoInfo.url));
-                runProgram("git", true, { "-C", tmpDir, "submodule", "--quiet", "update", "--init", "--recursive" });
+
+                Strings args = {
+                    "--git-dir", pathToGitFolder,
+                    "--work-tree", tmpDir,
+                    "-C", tmpDir, // necessary for `git-submodule` to work...
+                    "submodule", "update",
+                    "--init", "--recursive", "--quiet", "--recommend-shallow",
+                    "--jobs", getNumJobs(),
+                };
+
+                if (repoInfo.shallow) {
+                    args.emplace_back("--depth=1");
+                }
+
+                // try checking out submodules without fetching first since
+                // otherwise git seems to unnecessarily do a fetch when the
+                // submodule commit is present but not reachable
+                try {
+                    Strings argsNoFetch = Strings(args.begin(), args.end());
+                    argsNoFetch.emplace_back("--no-fetch");
+
+                    runProgram2({
+                        .program = "git",
+                        .args = argsNoFetch,
+                    });
+                } catch (ExecError &) {
+                    // TODO: cache these fetches for local sources
+                    runProgram("git", true, args);
+                }
             }
 
             filter = isNotDotGitDirectory;
